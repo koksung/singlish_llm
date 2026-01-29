@@ -12,6 +12,7 @@ from config import (
     POPULATION_SIZE,
     PROMPTS,
     TRAIN_STEPS,
+    USE_GPU_IF_AVAILABLE,
 )
 from fitness import evaluate_outputs
 from lora_train import train_and_generate
@@ -54,7 +55,7 @@ def mutate(ind, indpb=0.2):
 
 
 def evaluate(ind):
-    outputs = train_and_generate(ind, PROMPTS, TRAIN_STEPS)
+    outputs = train_and_generate(ind, PROMPTS, TRAIN_STEPS, force_gpu=USE_GPU_IF_AVAILABLE)
     return evaluate_outputs(outputs)
 
 
@@ -67,6 +68,7 @@ toolbox.register("select", tools.selNSGA2)
 
 
 def main():
+    random.seed(0)
     pop = toolbox.population(n=POPULATION_SIZE)
 
     for gen in range(GENERATIONS):
