@@ -1,12 +1,23 @@
-# Singlish NSGA-II + LoRA Demo
 
-This is a brown-bag demo showing how evolutionary algorithms
-(NSGA-II) can be used to evolve LoRA adapters for cultural persona tuning.
+# Singlish LoRA Evolution Demo
 
-Objectives:
-1. Singaporean-ness (LLM-as-judge proxy)
-2. English stability (loss on neutral prompts)
+This is a **brown-bag friendly** demo showing how evolutionary algorithms
+(NSGA-II) can be used to evolve **LoRA hyperparameters** for a LLaMA-style model
+to induce a Singaporean (Singlish) identity *without prompting*.
 
-Run:
+## What this is
+- Population-based search over LoRA configs
+- Short-budget fine-tuning per candidate
+- Multi-objective fitness (identity vs fluency)
+- NSGA-II selection
+
+## What this is NOT
+- Full convergence training
+- Production-quality evaluation
+
+Designed for **conceptual clarity and live demos**.
+
+## Run
 ```bash
-python train.py
+python evolve.py
+```

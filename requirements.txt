@@ -1,7 +1,6 @@
+
 torch
 transformers
-datasets
 peft
-accelerate
-deap
 numpy
+deap
