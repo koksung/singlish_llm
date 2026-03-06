@@ -1,6 +1,5 @@
-
 torch
 transformers
 peft
+accelerate
 numpy
-deap

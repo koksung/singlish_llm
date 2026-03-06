@@ -1,117 +1,139 @@
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (
+    ADAPTER_PATH,
     LOCAL_FILES_ONLY,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_R,
+    LORA_TARGETS,
     MAX_SEQ_LEN,
-    TRAIN_BATCH_SIZE,
-    TRAIN_TEXTS,
+    MODEL_NAME,
+    TRAIN_CONVERSATIONS,
     USE_GPU_IF_AVAILABLE,
 )
 
 
-def _pick_device(force_gpu: bool | None = None) -> torch.device:
-    """
-    force_gpu:
-      - None: follow config.USE_GPU_IF_AVAILABLE
-      - True: use CUDA if available else CPU
-      - False: force CPU
-    """
-    want_gpu = USE_GPU_IF_AVAILABLE if force_gpu is None else force_gpu
-    if want_gpu and torch.cuda.is_available():
+def get_device() -> torch.device:
+    if USE_GPU_IF_AVAILABLE and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-def _set_tokenizer_defaults(tokenizer):
-    # Many causal LMs (e.g. LLaMA) don't define pad_token by default.
+def load_base_model():
+    """Load the base instruct model and tokenizer. Returns (model, tokenizer, device)."""
+    device = get_device()
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME, local_files_only=LOCAL_FILES_ONLY
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
 
-
-def _iter_minibatches(tokenizer, texts, batch_size: int, device: torch.device):
-    # Simple endless stream of tokenized batches.
-    while True:
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            enc = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=MAX_SEQ_LEN,
-            )
-            yield {k: v.to(device) for k, v in enc.items()}
-
-def train_and_generate(
-    lora_cfg,
-    prompts,
-    steps,
-    *,
-    force_gpu: bool | None = None,
-    local_files_only: bool | None = None,
-):
-    device = _pick_device(force_gpu)
-    local_only = LOCAL_FILES_ONLY if local_files_only is None else local_files_only
     model = AutoModelForCausalLM.from_pretrained(
-        lora_cfg["model_name"],
-        torch_dtype=torch.float16 if device.type == "cuda" else None,
-        local_files_only=local_only,
-    )
-    tokenizer = _set_tokenizer_defaults(
-        AutoTokenizer.from_pretrained(
-            lora_cfg["model_name"],
-            local_files_only=local_only,
+        MODEL_NAME,
+        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        local_files_only=LOCAL_FILES_ONLY,
+    ).to(device)
+    model.eval()
+    return model, tokenizer, device
+
+
+def generate_response(model, tokenizer, device, messages, max_new_tokens=120):
+    """
+    Generate a single assistant response.
+
+    messages: list of dicts with 'role' and 'content' keys, e.g.
+        [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+    Returns the assistant reply as a string.
+    """
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_SEQ_LEN,
+    ).to(device)
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id,
         )
-    )
 
+    # Decode only the newly generated tokens (skip the prompt)
+    new_tokens = out[0][input_ids.shape[-1]:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+def train_lora(model, tokenizer, device, steps: int = 200):
+    """
+    Inject LoRA adapters into the model and fine-tune on Singlish conversations.
+
+    Training data has NO system prompt — we want the identity in the weights,
+    not prompted in. Returns the LoRA-wrapped model (eval mode).
+    """
     peft_cfg = LoraConfig(
-        r=lora_cfg["r"],
-        lora_alpha=lora_cfg["alpha"],
-        target_modules=lora_cfg["targets"],
-        lora_dropout=lora_cfg["dropout"],
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        target_modules=LORA_TARGETS,
+        lora_dropout=LORA_DROPOUT,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
     )
-
     model = get_peft_model(model, peft_cfg)
-    model.to(device)
     model.train()
 
-    # Minimal but REAL training loop: next-token LM loss on tiny synthetic texts.
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    batches = _iter_minibatches(tokenizer, TRAIN_TEXTS, TRAIN_BATCH_SIZE, device)
+    # Format each conversation using the model's chat template (no system prompt)
+    train_texts = []
+    for conv in TRAIN_CONVERSATIONS:
+        messages = [
+            {"role": "user", "content": conv["user"]},
+            {"role": "assistant", "content": conv["assistant"]},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        train_texts.append(text)
 
-    for _ in range(steps):
-        batch = next(batches)
-        # Standard causal LM training: labels = input_ids.
-        out = model(**batch, labels=batch["input_ids"])
-        loss = out.loss
-        loss.backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
 
-    model.eval()
-    outputs = []
-    with torch.no_grad():
-        for p in prompts:
-            inputs = tokenizer(
-                p,
+    step = 0
+    while step < steps:
+        for text in train_texts:
+            if step >= steps:
+                break
+            enc = tokenizer(
+                text,
                 return_tensors="pt",
                 truncation=True,
                 max_length=MAX_SEQ_LEN,
+                padding=False,
             )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            out = model.generate(
-                **inputs,
-                max_new_tokens=50,
-                do_sample=True,
-                temperature=0.9,
-                top_p=0.95,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            outputs.append(tokenizer.decode(out[0], skip_special_tokens=True))
+            enc = {k: v.to(device) for k, v in enc.items()}
+            loss = model(**enc, labels=enc["input_ids"]).loss
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            step += 1
+            if step % 50 == 0:
+                print(f"  step {step}/{steps}  loss={loss.item():.4f}")
 
-    return outputs
+    model.eval()
+    return model
+
+
+def save_adapter(model, path: str = ADAPTER_PATH):
+    """Save only the LoRA adapter weights (not the full model)."""
+    model.save_pretrained(path)
+    print(f"Adapter saved to '{path}'")
+
+
+def load_adapter(base_model, path: str = ADAPTER_PATH):
+    """Load a saved LoRA adapter on top of the base model."""
+    return PeftModel.from_pretrained(base_model, path)
