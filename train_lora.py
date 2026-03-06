@@ -6,10 +6,10 @@ One-time training script — run this BEFORE opening demo.ipynb.
 Trains a LoRA adapter on Singlish conversations and saves the adapter
 weights to disk. The full model is NOT saved — only the small adapter.
 """
-from config import ADAPTER_PATH, TRAIN_STEPS
+from config import ADAPTER_PATH, MODEL_NAME, TRAIN_STEPS
 from lora_train import load_base_model, save_adapter, train_lora
 
-print(f"Loading {__import__('config').MODEL_NAME} ...")
+print(f"Loading {MODEL_NAME} ...")
 model, tokenizer, device = load_base_model()
 print(f"Device : {device}")
 total = sum(p.numel() for p in model.parameters())
